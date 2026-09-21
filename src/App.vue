@@ -1,113 +1,158 @@
 <script setup>
-import { computed, nextTick, ref } from "vue";
+import { nextTick, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { modelConfig } from "./config";
+import { NMessageProvider } from "naive-ui";
 
-const input = ref("");
-const messages = ref([]);
-const isSending = ref(false);
-const status = ref("");
-const statusType = ref("idle");
-const messageList = ref(null);
-const canSend = computed(() => input.value.trim() && !isSending.value);
+const isLaunching = ref(true);
 
-function scrollToBottom() {
-  nextTick(() => {
-    const element = messageList.value;
-    if (element) element.scrollTop = element.scrollHeight;
-  });
-}
-
-function onKeydown(event) {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    sendMessage();
-  }
-}
-
-async function sendMessage() {
-  const question = input.value.trim();
-  if (!question || isSending.value) return;
-
-  if (!modelConfig.baseUrl || !modelConfig.apiKey || !modelConfig.model) {
-    status.value = "请先在 src/config.js 填写接口地址、API Key 和模型名称。";
-    statusType.value = "error";
-    return;
-  }
-
-  const history = messages.value.filter(
-    (message) => message.role === "user" || message.role === "assistant",
-  );
-  messages.value.push({ role: "user", content: question });
-  input.value = "";
-  isSending.value = true;
-  status.value = "正在生成回复";
-  statusType.value = "working";
-  scrollToBottom();
-
+onMounted(async () => {
+  await nextTick();
+  await new Promise((resolve) => requestAnimationFrame(resolve));
   try {
-    const answer = await invoke("chat_completion", {
-      request: {
-        baseUrl: modelConfig.baseUrl,
-        apiKey: modelConfig.apiKey,
-        model: modelConfig.model,
-        systemPrompt: modelConfig.systemPrompt,
-        temperature: modelConfig.temperature,
-        maxTokens: modelConfig.maxTokens,
-        messages: [...history, { role: "user", content: question }],
-      },
-    });
-    messages.value.push({ role: "assistant", content: answer });
-    status.value = "回复完成";
-    statusType.value = "success";
+    await invoke("show_main_window");
   } catch (error) {
-    messages.value.push({ role: "error", content: `请求失败：${String(error)}` });
-    status.value = "请求失败";
-    statusType.value = "error";
-  } finally {
-    isSending.value = false;
-    scrollToBottom();
+    console.error("显示主窗口失败", error);
   }
-}
-
-function clearConversation() {
-  messages.value = [];
-  status.value = "";
-  statusType.value = "idle";
-}
+  window.setTimeout(() => {
+    isLaunching.value = false;
+  }, 700);
+});
 </script>
 
 <template>
-  <main class="app-shell">
-    <header class="topbar" data-tauri-drag-region>
-      <div class="brand" data-tauri-drag-region>
-        <div class="brand-mark" aria-hidden="true">AI</div>
-        <div data-tauri-drag-region>
-          <h1>AI Desk</h1>
-          <p>新建对话</p>
+  <n-message-provider>
+    <router-view />
+    <Transition name="launch-screen">
+      <div v-if="isLaunching" class="launch-screen" aria-live="polite" aria-label="AI-fast 正在启动">
+        <div class="launch-grid"></div>
+        <div class="launch-content">
+          <div class="launch-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div class="launch-brand">AI-fast</div>
+          <p>正在准备你的工作空间</p>
+          <div class="launch-progress" aria-hidden="true"><span></span></div>
         </div>
       </div>
-      <button class="icon-button" type="button" title="清空对话" aria-label="清空对话" :disabled="messages.length === 0 || isSending" @click="clearConversation"><span aria-hidden="true">⌫</span></button>
-    </header>
-
-    <section ref="messageList" class="conversation" aria-live="polite">
-      <div v-if="messages.length === 0" class="welcome">
-        <div class="welcome-mark" aria-hidden="true">AI</div>
-        <h2>今天想解决什么问题？</h2>
-        <p>开始输入，当前会话会保留上下文。</p>
-      </div>
-      <article v-for="(message, index) in messages" :key="index" class="message" :class="message.role">
-        <div class="message-label">{{ message.role === "user" ? "你" : message.role === "assistant" ? "AI 助手" : "系统" }}</div>
-        <div class="message-body">{{ message.content }}</div>
-      </article>
-    </section>
-
-    <footer class="composer-wrap">
-      <form class="composer" @submit.prevent="sendMessage">
-        <textarea v-model="input" :disabled="isSending" rows="1" placeholder="输入消息" aria-label="输入消息" @keydown="onKeydown" />
-        <button class="send-button" type="submit" :disabled="!canSend" aria-label="发送消息" title="发送消息"><span aria-hidden="true">↑</span></button>
-      </form>
-      <p class="status" :class="statusType">{{ status || "Enter 发送，Shift + Enter 换行" }}</p>
-    </footer>
-  </main>
+    </Transition>
+  </n-message-provider>
 </template>
+
+<style scoped>
+.launch-screen {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: #f6f7fb;
+  color: #263244;
+}
+
+.launch-grid {
+  position: absolute;
+  inset: 0;
+  opacity: 0.55;
+  background-image: linear-gradient(#dfe4ec 1px, transparent 1px), linear-gradient(90deg, #dfe4ec 1px, transparent 1px);
+  background-size: 36px 36px;
+  mask-image: radial-gradient(ellipse 72% 58% at center, #000 10%, transparent 78%);
+}
+
+.launch-content {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  width: min(280px, calc(100vw - 48px));
+  animation: launch-enter 520ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.launch-mark {
+  display: grid;
+  grid-template-columns: repeat(3, 12px);
+  gap: 6px;
+  margin-bottom: 18px;
+}
+
+.launch-mark span {
+  width: 12px;
+  height: 34px;
+  border-radius: 3px;
+  background: #1f6feb;
+  animation: launch-pulse 1100ms ease-in-out infinite;
+}
+
+.launch-mark span:nth-child(2) {
+  height: 46px;
+  background: #258343;
+  animation-delay: 120ms;
+}
+
+.launch-mark span:nth-child(3) {
+  height: 26px;
+  align-self: end;
+  background: #f0a119;
+  animation-delay: 240ms;
+}
+
+.launch-brand {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.launch-content p {
+  margin: 8px 0 22px;
+  color: #8792a3;
+  font-size: 14px;
+}
+
+.launch-progress {
+  width: 100%;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: #dfe4ec;
+}
+
+.launch-progress span {
+  display: block;
+  width: 42%;
+  height: 100%;
+  border-radius: inherit;
+  background: #1f6feb;
+  animation: launch-progress 1100ms ease-in-out infinite;
+}
+
+.launch-screen-leave-active {
+  transition: opacity 260ms ease;
+}
+
+.launch-screen-leave-to {
+  opacity: 0;
+}
+
+@keyframes launch-enter {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes launch-pulse {
+  0%, 100% { transform: scaleY(0.82); opacity: 0.7; }
+  50% { transform: scaleY(1); opacity: 1; }
+}
+
+@keyframes launch-progress {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(250%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .launch-content,
+  .launch-mark span,
+  .launch-progress span {
+    animation: none;
+  }
+}
+</style>
