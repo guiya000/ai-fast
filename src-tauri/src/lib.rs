@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    path::{Path, PathBuf},
+    process::Command,
     sync::Mutex,
 };
 use tauri::{
@@ -19,6 +21,11 @@ const CHAT_CANCELED: &str = "CHAT_CANCELED";
 struct ChatState {
     canceled: Mutex<HashSet<String>>,
     cancelers: Mutex<HashMap<String, watch::Sender<bool>>>,
+}
+
+#[derive(Default)]
+struct WorkspaceState {
+    root: Mutex<Option<PathBuf>>,
 }
 
 impl ChatState {
@@ -70,10 +77,34 @@ struct ChatImage {
     name: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceChat {
+    #[serde(default)]
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    params: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceConfig {
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    chats: HashMap<String, WorkspaceChat>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatRequest {
     messages: Vec<ChatMessage>,
+    #[serde(default)]
+    model_id: Option<String>,
     #[serde(default)]
     reasoning_effort: Option<String>,
     #[serde(default)]
@@ -151,6 +182,8 @@ struct ModelProfile {
     name: String,
     #[serde(default = "default_function_type")]
     function_type: String,
+    #[serde(default = "default_input_types")]
+    input_types: Vec<String>,
     #[serde(default = "default_api_format")]
     api_format: String,
     #[serde(default)]
@@ -201,6 +234,13 @@ fn default_param_type() -> String {
 fn default_function_type() -> String {
     "chat".to_string()
 }
+fn default_input_types() -> Vec<String> {
+    vec!["text".to_string()]
+}
+
+fn model_supports_input_type(model: &ModelProfile, input_type: &str) -> bool {
+    model.input_types.iter().any(|item| item == input_type)
+}
 fn model_endpoint(base_url: &str, request_path: &str, default_path: &str) -> String {
     let path = if request_path.trim().is_empty() {
         default_path
@@ -227,6 +267,10 @@ struct AppSettings {
     active_model_id: Option<String>,
     #[serde(default)]
     suppliers: Vec<Supplier>,
+    #[serde(default = "default_editor_language")]
+    editor_language: String,
+    #[serde(default = "default_shortcuts")]
+    shortcuts: HashMap<String, String>,
     #[serde(default, skip_serializing)]
     models: Vec<ModelProfile>,
 }
@@ -239,6 +283,7 @@ struct ModelProfileView {
     id: String,
     name: String,
     function_type: String,
+    input_types: Vec<String>,
     api_format: String,
     request_path: String,
     base_url: String,
@@ -257,6 +302,8 @@ struct AppSettingsView {
     language: String,
     autostart: bool,
     active_model_id: Option<String>,
+    editor_language: String,
+    shortcuts: HashMap<String, String>,
     suppliers: Vec<SupplierView>,
     models: Vec<ModelProfileView>,
 }
@@ -276,6 +323,37 @@ fn default_language() -> String {
     "zh-CN".to_string()
 }
 
+fn default_editor_language() -> String {
+    "zh-CN".to_string()
+}
+
+fn default_shortcuts() -> HashMap<String, String> {
+    HashMap::from([
+        ("closeTab".to_string(), "Ctrl+W".to_string()),
+        ("switchTab".to_string(), "Ctrl+Tab".to_string()),
+        ("nextTab".to_string(), "Ctrl+PageDown".to_string()),
+        ("previousTab".to_string(), "Ctrl+PageUp".to_string()),
+        ("quickOpen".to_string(), "Ctrl+P".to_string()),
+        ("commandPalette".to_string(), "Ctrl+Shift+P".to_string()),
+        ("saveFile".to_string(), "Ctrl+S".to_string()),
+        ("aiEdit".to_string(), "Ctrl+Enter".to_string()),
+        ("formatDocument".to_string(), "Shift+Alt+F".to_string()),
+        ("toggleComment".to_string(), "Ctrl+/".to_string()),
+        ("goToDefinition".to_string(), "F12".to_string()),
+        ("renameSymbol".to_string(), "F2".to_string()),
+    ])
+}
+
+fn normalize_editor_settings(settings: &mut AppSettings) {
+    if !matches!(settings.editor_language.as_str(), "zh-CN" | "en-US") {
+        settings.editor_language = default_editor_language();
+    }
+    let defaults = default_shortcuts();
+    for (key, value) in defaults {
+        settings.shortcuts.entry(key).or_insert(value);
+    }
+}
+
 fn settings_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let path = app
         .path()
@@ -288,6 +366,20 @@ fn settings_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
 fn keyring_entry(model_id: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, model_id)
         .map_err(|error| format!("无法打开系统凭据存储：{error}"))
+}
+
+fn credential_id(supplier_name: &str, model_id: &str) -> String {
+    format!("{supplier_name}::{model_id}")
+}
+
+fn read_model_api_key(model: &ModelProfile) -> String {
+    model.api_key.trim().to_string()
+}
+
+fn read_keyring_api_key(supplier_name: &str, model_id: &str) -> String {
+    keyring_entry(&credential_id(supplier_name, model_id))
+        .and_then(|entry| entry.get_password().map_err(|error| error.to_string()))
+        .unwrap_or_default()
 }
 
 fn read_api_key(model_id: &str) -> Result<String, String> {
@@ -316,6 +408,8 @@ fn default_settings() -> AppSettings {
         autostart: false,
         active_model_id: None,
         suppliers: Vec::new(),
+        editor_language: default_editor_language(),
+        shortcuts: default_shortcuts(),
         models: Vec::new(),
     }
 }
@@ -344,6 +438,7 @@ fn migrate_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
                     } else {
                         legacy.function_type
                     },
+                    input_types: default_input_types(),
                     api_format: legacy.api_format,
                     request_path: legacy.request_path,
                     base_url: legacy.base_url,
@@ -433,6 +528,7 @@ fn supplier_model_view(supplier: &Supplier, model: &ModelProfile) -> ModelProfil
         id: model.id.clone(),
         name: model.name.clone(),
         function_type: model_function_type(model),
+        input_types: model.input_types.clone(),
         api_format: model.api_format.clone(),
         request_path: model.request_path.clone(),
         base_url: supplier.config.base_url.clone(),
@@ -467,15 +563,17 @@ fn settings_view(settings: AppSettings) -> AppSettingsView {
         language: settings.language,
         autostart: settings.autostart,
         active_model_id: settings.active_model_id,
+        editor_language: settings.editor_language,
+        shortcuts: settings.shortcuts,
         suppliers,
         models,
     }
 }
 
-fn active_model_config(app: &AppHandle) -> Result<(ModelProfile, String), String> {
+fn model_config_for_id(app: &AppHandle, requested_id: Option<&str>) -> Result<(ModelProfile, String), String> {
     let settings = migrate_settings(load_settings_file(app)?.unwrap_or_else(default_settings))?;
     let language = settings.language.clone();
-    let active_id = settings.active_model_id.as_deref();
+    let active_id = requested_id.or(settings.active_model_id.as_deref());
     let selected = settings
         .suppliers
         .iter()
@@ -488,6 +586,7 @@ fn active_model_config(app: &AppHandle) -> Result<(ModelProfile, String), String
     let (supplier, model) = selected.ok_or_else(|| "请先在设置中添加并选择一个模型".to_string())?;
     let mut model = model.clone();
     model.base_url = supplier.config.base_url.clone();
+    model.api_key = read_model_api_key(&model);
     if model.base_url.trim().is_empty()
         || model.api_key.trim().is_empty()
         || model.id.trim().is_empty()
@@ -495,6 +594,10 @@ fn active_model_config(app: &AppHandle) -> Result<(ModelProfile, String), String
         return Err("当前模型缺少 API 地址、API Key 或模型 ID".to_string());
     }
     Ok((model, language))
+}
+
+fn active_model_config(app: &AppHandle) -> Result<(ModelProfile, String), String> {
+    model_config_for_id(app, None)
 }
 
 fn system_prompt_for(language: &str) -> &'static str {
@@ -510,6 +613,8 @@ fn load_settings(app: AppHandle) -> Result<AppSettingsView, String> {
     let original = load_settings_file(&app)?.unwrap_or_else(default_settings);
     let was_legacy = original.suppliers.is_empty() && !original.models.is_empty();
     let mut settings = migrate_settings(original)?;
+    normalize_editor_settings(&mut settings);
+    let credentials_restored = migrate_model_credentials(&mut settings)?;
     let active_exists = settings
         .active_model_id
         .as_deref()
@@ -529,14 +634,32 @@ fn load_settings(app: AppHandle) -> Result<AppSettingsView, String> {
             .and_then(|supplier| supplier.models.first())
             .map(|model| model_config_id(&settings.suppliers[0].name, &model.name));
     }
-    if was_legacy {
+    if was_legacy || credentials_restored {
         save_settings_file(&app, &settings)?;
     }
     Ok(settings_view(settings))
 }
 
+fn migrate_model_credentials(settings: &mut AppSettings) -> Result<bool, String> {
+    let mut migrated = false;
+    for supplier in &mut settings.suppliers {
+        let supplier_name = supplier.name.clone();
+        for model in &mut supplier.models {
+            if model.api_key.trim().is_empty() {
+                let api_key = read_keyring_api_key(&supplier_name, &model.id);
+                if !api_key.is_empty() {
+                    model.api_key = api_key;
+                    migrated = true;
+                }
+            }
+        }
+    }
+    Ok(migrated)
+}
+
 #[tauri::command]
 fn save_settings(app: AppHandle, mut settings: AppSettings) -> Result<AppSettingsView, String> {
+    normalize_editor_settings(&mut settings);
     let mut supplier_names = std::collections::HashSet::new();
     for supplier in &mut settings.suppliers {
         let supplier_name = supplier.name.trim().to_string();
@@ -555,11 +678,16 @@ fn save_settings(app: AppHandle, mut settings: AppSettings) -> Result<AppSetting
         for model in &mut supplier.models {
             let model_name = model.name.trim().to_string();
             let function_type = model_function_type(model);
+            let api_key = model.api_key.trim().to_string();
+            model.input_types.retain(|input_type| matches!(input_type.as_str(), "text" | "image"));
+            if !model.input_types.iter().any(|input_type| input_type == "text") {
+                model.input_types.insert(0, "text".to_string());
+            }
             if model.id.trim().is_empty()
                 || model_name.chars().count() < 2
                 || model_name.chars().count() > 20
                 || model.api_format.trim().is_empty()
-                || model.api_key.trim().is_empty()
+                || api_key.is_empty()
                 || !model.temperature.is_finite()
                 || !(0.0..=2.0).contains(&model.temperature)
                 || model.max_tokens < 500
@@ -574,7 +702,7 @@ fn save_settings(app: AppHandle, mut settings: AppSettings) -> Result<AppSetting
             model.name = model_name;
             model.function_type = function_type;
             model.request_path = model.request_path.trim().to_string();
-            model.api_key = model.api_key.trim().to_string();
+            model.api_key = api_key;
             let mut param_keys = HashSet::new();
             for param in &mut model.params {
                 param.key = param.key.trim().to_string();
@@ -809,11 +937,22 @@ async fn edit_image(app: AppHandle, request: ImageEditRequest) -> Result<ImagesA
 fn clear_app_data(app: AppHandle) -> Result<(), String> {
     apply_autostart(false)?;
 
+    if let Some(settings) = load_settings_file(&app)? {
+        let settings = migrate_settings(settings)?;
+        for supplier in &settings.suppliers {
+            for model in &supplier.models {
+                if let Ok(entry) = keyring_entry(&credential_id(&supplier.name, &model.id)) {
+                    let _ = entry.delete_credential();
+                }
+            }
+        }
+    }
+
     let app_dir = app
         .path()
         .app_config_dir()
         .map_err(|error| format!("Unable to locate app config directory: {error}"))?;
-    for file_name in ["settings.json", "conversations.json", "config.json"] {
+    for file_name in ["settings.json", "conversations.json", "config.json", "workspace.json"] {
         let path = app_dir.join(file_name);
         if path.exists() {
             fs::remove_file(path).map_err(|error| format!("清除应用数据失败：{error}"))?;
@@ -827,6 +966,50 @@ fn conversations_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
         .app_config_dir()
         .map(|path| path.join("conversations.json"))
         .map_err(|error| format!("Unable to locate app config directory: {error}"))
+}
+
+fn workspace_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|path| path.join("workspace.json"))
+        .map_err(|error| format!("无法定位工作区配置目录：{error}"))
+}
+
+fn load_workspace_config_file(app: &AppHandle) -> Result<WorkspaceConfig, String> {
+    let path = workspace_path(app)?;
+    if !path.exists() {
+        return Ok(WorkspaceConfig::default());
+    }
+    let body = fs::read_to_string(path).map_err(|error| format!("读取工作区配置失败：{error}"))?;
+    if body.trim_start().starts_with('{') {
+        serde_json::from_str(&body).map_err(|error| format!("工作区配置格式错误：{error}"))
+    } else {
+        let root = body.trim();
+        Ok(WorkspaceConfig {
+            root: (!root.is_empty()).then(|| root.to_string()),
+            ..WorkspaceConfig::default()
+        })
+    }
+}
+
+fn save_workspace_config_file(app: &AppHandle, config: &WorkspaceConfig) -> Result<(), String> {
+    let path = workspace_path(app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建工作区配置目录失败：{error}"))?;
+    }
+    let body = serde_json::to_string_pretty(config)
+        .map_err(|error| format!("保存工作区配置失败：{error}"))?;
+    fs::write(path, body).map_err(|error| format!("写入工作区配置失败：{error}"))
+}
+
+#[tauri::command]
+fn load_workspace_config(app: AppHandle) -> Result<WorkspaceConfig, String> {
+    load_workspace_config_file(&app)
+}
+
+#[tauri::command]
+fn save_workspace_config(app: AppHandle, config: WorkspaceConfig) -> Result<(), String> {
+    save_workspace_config_file(&app, &config)
 }
 
 #[tauri::command]
@@ -850,6 +1033,286 @@ fn save_conversations(app: AppHandle, conversations: Vec<Conversation>) -> Resul
     let body = serde_json::to_string_pretty(&conversations)
         .map_err(|error| format!("保存历史对话失败：{error}"))?;
     fs::write(path, body).map_err(|error| format!("写入历史对话失败：{error}"))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceEntry {
+    name: String,
+    path: String,
+    is_directory: bool,
+    children: Vec<WorkspaceEntry>,
+}
+
+fn current_workspace_root(state: &WorkspaceState) -> Result<PathBuf, String> {
+    state
+        .root
+        .lock()
+        .map_err(|_| "工作区状态不可用".to_string())?
+        .clone()
+        .ok_or_else(|| "请先打开一个工作区".to_string())
+}
+
+fn safe_workspace_path(state: &WorkspaceState, relative_path: &str, allow_missing: bool) -> Result<PathBuf, String> {
+    let root = current_workspace_root(state)?;
+    let relative = Path::new(relative_path);
+    if relative_path.trim().is_empty() || relative.is_absolute() {
+        return Err("工作区路径无效".to_string());
+    }
+    if relative.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+        return Err("工作区路径无效".to_string());
+    }
+    let candidate = root.join(relative);
+    let checked = if candidate.exists() {
+        candidate
+            .canonicalize()
+            .map_err(|error| format!("无法解析工作区路径：{error}"))?
+    } else if allow_missing {
+        let mut existing = candidate.as_path();
+        while !existing.exists() {
+            existing = existing
+                .parent()
+                .ok_or_else(|| "工作区路径无效".to_string())?;
+        }
+        let existing = existing
+            .canonicalize()
+            .map_err(|error| format!("无法解析工作区父目录：{error}"))?;
+        let suffix = candidate
+            .strip_prefix(existing.as_path())
+            .unwrap_or_else(|_| Path::new(relative_path));
+        existing.join(suffix)
+    } else {
+        return Err("工作区文件不存在".to_string());
+    };
+    if !checked.starts_with(&root) {
+        return Err("工作区路径超出当前工作区范围".to_string());
+    }
+    Ok(checked)
+}
+
+fn ignored_workspace_entry(name: &str) -> bool {
+    matches!(name, ".git" | ".idea" | "node_modules" | "target" | "dist" | "coverage")
+}
+
+fn workspace_entries(root: &Path, directory: &Path, depth: usize) -> Result<Vec<WorkspaceEntry>, String> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|error| format!("读取工作区目录失败：{error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| !ignored_workspace_entry(&entry.file_name().to_string_lossy()))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| (!entry.path().is_dir(), entry.file_name()));
+    entries
+        .into_iter()
+        .map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|error| format!("解析工作区相对路径失败：{error}"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let is_directory = path.is_dir();
+            let children = if is_directory && depth < 20 {
+                workspace_entries(root, &path, depth + 1)?
+            } else {
+                Vec::new()
+            };
+            Ok(WorkspaceEntry { name, path: relative, is_directory, children })
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn set_workspace_root(app: AppHandle, state: State<'_, WorkspaceState>, path: String) -> Result<String, String> {
+    let root = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("无法打开工作区：{error}"))?;
+    if !root.is_dir() {
+        return Err("工作区必须是文件夹".to_string());
+    }
+    let mut config = load_workspace_config_file(&app)?;
+    config.root = Some(root.to_string_lossy().to_string());
+    save_workspace_config_file(&app, &config)?;
+    *state.root.lock().map_err(|_| "工作区状态不可用".to_string())? = Some(root.clone());
+    Ok(root.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn get_workspace_root(app: AppHandle, state: State<'_, WorkspaceState>) -> Result<Option<String>, String> {
+    let mut stored = state.root.lock().map_err(|_| "工作区状态不可用".to_string())?;
+    if stored.is_none() {
+        if let Ok(config) = load_workspace_config_file(&app) {
+            if let Some(path) = config.root {
+                let path = PathBuf::from(path.trim());
+                if path.is_dir() {
+                    *stored = Some(path);
+                }
+            }
+        }
+    }
+    Ok(stored.as_ref().map(|path| path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn list_workspace_entries(state: State<'_, WorkspaceState>) -> Result<Vec<WorkspaceEntry>, String> {
+    let root = current_workspace_root(&state)?;
+    workspace_entries(&root, &root, 0)
+}
+
+#[tauri::command]
+fn read_workspace_file(state: State<'_, WorkspaceState>, path: String) -> Result<String, String> {
+    let file = safe_workspace_path(&state, &path, false)?;
+    if !file.is_file() {
+        return Err("工作区路径不是文件".to_string());
+    }
+    let metadata = fs::metadata(&file).map_err(|error| format!("读取文件信息失败：{error}"))?;
+    if metadata.len() > 5 * 1024 * 1024 {
+        return Err("文件超过 5 MB，暂不支持在编辑器中打开".to_string());
+    }
+    fs::read_to_string(file).map_err(|error| format!("读取工作区文件失败：{error}"))
+}
+
+#[tauri::command]
+fn write_workspace_file(state: State<'_, WorkspaceState>, path: String, content: String) -> Result<(), String> {
+    let file = safe_workspace_path(&state, &path, true)?;
+    if file.exists() && !file.is_file() {
+        return Err("工作区路径不是文件".to_string());
+    }
+    fs::write(file, content).map_err(|error| format!("保存工作区文件失败：{error}"))
+}
+
+#[tauri::command]
+fn create_workspace_file(state: State<'_, WorkspaceState>, path: String) -> Result<(), String> {
+    let file = safe_workspace_path(&state, &path, true)?;
+    if file.exists() {
+        return Err("文件已经存在".to_string());
+    }
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建文件目录失败：{error}"))?;
+    }
+    fs::File::create(file).map_err(|error| format!("创建工作区文件失败：{error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_workspace_file(state: State<'_, WorkspaceState>, path: String) -> Result<(), String> {
+    let file = safe_workspace_path(&state, &path, false)?;
+    if file.is_dir() {
+        return fs::remove_dir_all(file).map_err(|error| format!("删除工作区文件夹失败：{error}"));
+    }
+    fs::remove_file(file).map_err(|error| format!("删除工作区文件失败：{error}"))
+}
+
+#[tauri::command]
+fn create_workspace_directory(state: State<'_, WorkspaceState>, path: String) -> Result<(), String> {
+    let directory = safe_workspace_path(&state, &path, true)?;
+    if directory.exists() {
+        return Err("文件夹已经存在".to_string());
+    }
+    fs::create_dir_all(directory).map_err(|error| format!("创建工作区文件夹失败：{error}"))
+}
+
+fn workspace_child_path(state: &WorkspaceState, path: &str, name: &str) -> Result<PathBuf, String> {
+    if name.trim().is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        return Err("名称无效".to_string());
+    }
+    let source = safe_workspace_path(state, path, false)?;
+    let parent = source.parent().ok_or_else(|| "工作区路径无效".to_string())?;
+    let root = current_workspace_root(state)?;
+    let parent = parent.canonicalize().map_err(|error| format!("无法解析目标目录：{error}"))?;
+    if !parent.starts_with(&root) {
+        return Err("目标路径超出当前工作区范围".to_string());
+    }
+    let target = parent.join(name);
+    if target.exists() {
+        return Err("目标名称已经存在".to_string());
+    }
+    Ok(target)
+}
+
+#[tauri::command]
+fn rename_workspace_entry(state: State<'_, WorkspaceState>, path: String, name: String) -> Result<(), String> {
+    let source = safe_workspace_path(&state, &path, false)?;
+    let target = workspace_child_path(&state, &path, name.trim())?;
+    fs::rename(source, target).map_err(|error| format!("重命名工作区条目失败：{error}"))
+}
+
+fn copy_workspace_entry(source: &Path, target: &Path) -> Result<(), String> {
+    if source.is_dir() {
+        fs::create_dir(target).map_err(|error| format!("创建复制目录失败：{error}"))?;
+        for entry in fs::read_dir(source).map_err(|error| format!("读取复制目录失败：{error}"))? {
+            let entry = entry.map_err(|error| format!("读取复制条目失败：{error}"))?;
+            copy_workspace_entry(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        fs::copy(source, target)
+            .map(|_| ())
+            .map_err(|error| format!("复制工作区条目失败：{error}"))
+    }
+}
+
+#[tauri::command]
+fn paste_workspace_entry(
+    state: State<'_, WorkspaceState>,
+    source: String,
+    destination: String,
+    cut: bool,
+) -> Result<(), String> {
+    let source_path = safe_workspace_path(&state, &source, false)?;
+    let root = current_workspace_root(&state)?;
+    let destination_path = if destination.trim().is_empty() {
+        root.clone()
+    } else {
+        safe_workspace_path(&state, &destination, false)?
+    };
+    if !destination_path.is_dir() {
+        return Err("粘贴目标不是文件夹".to_string());
+    }
+    let name = source_path.file_name().ok_or_else(|| "工作区路径无效".to_string())?;
+    let target = destination_path.join(name);
+    if target.exists() {
+        return Err("目标文件夹中已经存在同名条目".to_string());
+    }
+    if target.starts_with(&source_path) {
+        return Err("不能将文件夹粘贴到自身内部".to_string());
+    }
+    if cut {
+        fs::rename(source_path, target).map_err(|error| format!("移动工作区条目失败：{error}"))
+    } else {
+        copy_workspace_entry(&source_path, &target)
+    }
+}
+
+#[tauri::command]
+fn open_workspace_in_explorer(state: State<'_, WorkspaceState>, path: Option<String>) -> Result<(), String> {
+    let target = match path.filter(|value| !value.trim().is_empty()) {
+        Some(path) => safe_workspace_path(&state, &path, false)?,
+        None => current_workspace_root(&state)?,
+    };
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("explorer");
+        if target.is_file() {
+            command.arg(format!("/select,{}", target.display()));
+        } else {
+            command.arg(target.as_os_str());
+        }
+        command.spawn().map_err(|error| format!("打开资源管理器失败：{error}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(target).spawn().map_err(|error| format!("打开文件管理器失败：{error}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open").arg(target).spawn().map_err(|error| format!("打开文件管理器失败：{error}"))?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err("当前平台暂不支持打开文件管理器".to_string())
 }
 
 #[derive(Serialize)]
@@ -1963,7 +2426,13 @@ async fn chat_completion(
         .unwrap_or_else(|| format!("stream-{}", chrono_like_timestamp()));
     request.stream_id = Some(stream_id.clone());
     let mut cancellation = state.start(&stream_id);
-    let (config, language) = active_model_config(&app)?;
+    let (config, language) = model_config_for_id(&app, request.model_id.as_deref())?;
+    if request.messages.iter().any(|message| !message.images.is_empty())
+        && !model_supports_input_type(&config, "image")
+    {
+        state.finish(&stream_id);
+        return Err("当前模型未配置图片输入".to_string());
+    }
     let result = match config.api_format.trim() {
         "responses" | "responsesApi" => {
             chat_completion_responses(app, &state, request, config, language, &mut cancellation)
@@ -2019,6 +2488,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(ChatState::default())
+        .manage(WorkspaceState::default())
         .setup(|app| {
             let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出应用", true, None::<&str>)?;
@@ -2073,7 +2543,20 @@ pub fn run() {
             list_provider_models,
             generate_image,
             edit_image,
-            clear_app_data
+            clear_app_data,
+            load_workspace_config,
+            save_workspace_config,
+            set_workspace_root,
+            get_workspace_root,
+            list_workspace_entries,
+            read_workspace_file,
+            write_workspace_file,
+            create_workspace_file,
+            delete_workspace_file,
+            create_workspace_directory,
+            rename_workspace_entry,
+            paste_workspace_entry,
+            open_workspace_in_explorer
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");

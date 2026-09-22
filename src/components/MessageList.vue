@@ -1,20 +1,16 @@
 <script setup>
 import { computed, nextTick, ref, watch } from "vue";
-import { open } from "@tauri-apps/plugin-shell";
 import { useMessage } from "naive-ui";
 import { copyFor } from "../i18n";
-import DOMPurify from "dompurify";
-import MarkdownIt from "markdown-it";
 import CopyIcon from "./icons/CopyIcon.vue";
 import EditIcon from "./icons/EditIcon.vue";
 import ImagePreview from "./ImagePreview.vue";
+import MarkdownContent from "./MarkdownContent.vue";
 import ReferenceIcon from "./icons/ReferenceIcon.vue";
 import TrashIcon from "./icons/TrashIcon.vue";
 const emit = defineEmits(["delete-message", "edit-message", "reference-image"]);
-const copiedMessageIndex = ref(null);
 const shouldAutoScroll = ref(true);
 const message = useMessage();
-let copiedMessageTimer = null;
 
 const props = defineProps({
   messages: { type: Array, required: true },
@@ -22,35 +18,16 @@ const props = defineProps({
   isGeneratingImage: { type: Boolean, default: false },
   imageEditingAvailable: { type: Boolean, default: false },
   locale: { type: String, default: "zh-CN" },
+  variant: { type: String, default: "default" },
+  emptyTitle: { type: String, default: "" },
+  emptySubtitle: { type: String, default: "" },
+  allowCopy: { type: Boolean, default: true },
+  allowEdit: { type: Boolean, default: true },
+  allowDelete: { type: Boolean, default: true },
 });
 
 const messageList = ref(null);
 const copy = computed(() => copyFor(props.locale));
-const markdown = new MarkdownIt({
-  html: false,
-  breaks: true,
-  linkify: true,
-  typographer: true,
-});
-
-function renderMarkdown(content) {
-  return DOMPurify.sanitize(markdown.render(content || ""));
-}
-
-async function openLink(event) {
-  const link = event.target.closest("a");
-  if (!link) return;
-  const href = link.getAttribute("href");
-  if (!/^https?:\/\//i.test(href || "")) return;
-  event.preventDefault();
-  try {
-    await open(href);
-  } catch (error) {
-    console.error("打开链接失败", error);
-    message.error(`${copy.value.openLinkFailed}：${String(error)}`, { duration: 2000 });
-  }
-}
-
 function scrollToBottom(force = false) {
   if (force) shouldAutoScroll.value = true;
   if (!force && !shouldAutoScroll.value) return;
@@ -66,14 +43,10 @@ function handleScroll() {
   shouldAutoScroll.value = element.scrollHeight - element.scrollTop - element.clientHeight <= 48;
 }
 
-async function copyMessage(content, index) {
+async function copyMessage(content) {
   try {
     await navigator.clipboard.writeText(content);
-    copiedMessageIndex.value = index;
-    clearTimeout(copiedMessageTimer);
-    copiedMessageTimer = setTimeout(() => {
-      copiedMessageIndex.value = null;
-    }, 1800);
+    message.success(copy.value.copySuccess, { duration: 1800 });
   } catch (error) {
     console.error("复制消息失败", error);
     message.error(`${copy.value.copyFailed}：${String(error)}`, { duration: 2000 });
@@ -85,11 +58,11 @@ defineExpose({ scrollToBottom });
 </script>
 
 <template>
-  <section ref="messageList" class="conversation" aria-live="polite" @scroll="handleScroll">
+  <section ref="messageList" class="conversation" :class="{ compact: props.variant === 'compact' }" aria-live="polite" @scroll="handleScroll">
     <div v-if="props.messages.length === 0" class="welcome">
       <div class="welcome-mark" aria-hidden="true">AI</div>
-      <h2>{{ copy.welcomeTitle }}</h2>
-      <p>{{ copy.welcomeSubtitle }}</p>
+      <h2>{{ props.emptyTitle || copy.welcomeTitle }}</h2>
+      <p>{{ props.emptySubtitle || copy.welcomeSubtitle }}</p>
     </div>
     <article v-for="(message, index) in props.messages" v-show="!(message.role === 'assistant' && props.isSending && !message.content && !message.images?.length)" :key="`${message.role}-${index}`" class="message" :class="message.role">
       <div class="message-avatar" aria-hidden="true">{{ message.role === "user" ? "我" : message.role === "assistant" ? "AI" : "!" }}</div>
@@ -99,7 +72,7 @@ defineExpose({ scrollToBottom });
           <div v-if="message.images?.length" class="message-image-list">
             <ImagePreview v-for="image in message.images" :key="image.dataUrl" :image="image" :locale="props.locale" />
           </div>
-          <div v-if="message.content" class="markdown-body" v-html="renderMarkdown(message.content)" @click="openLink"></div>
+          <MarkdownContent v-if="message.content" :content="message.content" :locale="props.locale" />
         </div>
         <div v-else class="message-body">
           <div v-if="message.images?.length" class="message-image-list">
@@ -108,11 +81,10 @@ defineExpose({ scrollToBottom });
           <p v-if="message.content" class="message-text">{{ message.content }}</p>
         </div>
         <div v-if="(message.content || message.images?.length) && message.role !== 'error'" class="message-actions">
-          <button v-if="message.content" type="button" :title="copiedMessageIndex === index ? copy.copied : copy.copyMessage" :aria-label="copiedMessageIndex === index ? copy.copied : copy.copyMessage" @click="copyMessage(message.content, index)"><CopyIcon /></button>
-          <button v-if="message.role === 'user'" type="button" :title="copy.editMessage" :aria-label="copy.editMessage" @click="emit('edit-message', index)"><EditIcon /></button>
+          <button v-if="props.allowCopy && message.content" type="button" :title="copy.copyMessage" :aria-label="copy.copyMessage" @click="copyMessage(message.content)"><CopyIcon /></button>
+          <button v-if="props.allowEdit && message.role === 'user'" type="button" :title="copy.editMessage" :aria-label="copy.editMessage" @click="emit('edit-message', index)"><EditIcon /></button>
           <button v-if="props.imageEditingAvailable && message.role === 'assistant' && message.images?.length" type="button" :title="copy.referenceImage" :aria-label="copy.referenceImage" @click="emit('reference-image', { image: message.images[0] })"><ReferenceIcon /></button>
-          <span v-if="copiedMessageIndex === index" class="copy-success" role="status">{{ copy.copied }}</span>
-          <button type="button" :disabled="props.isSending" :title="copy.deleteMessage" :aria-label="copy.deleteMessage" @click="emit('delete-message', index)"><TrashIcon /></button>
+          <button v-if="props.allowDelete" type="button" :disabled="props.isSending" :title="copy.deleteMessage" :aria-label="copy.deleteMessage" @click="emit('delete-message', index)"><TrashIcon /></button>
         </div>
       </div>
     </article>
@@ -139,6 +111,47 @@ defineExpose({ scrollToBottom });
   margin: 0 auto;
   padding: 34px 24px;
   overflow-y: auto;
+}
+
+.conversation.compact {
+  width: 100%;
+  padding: 14px 12px;
+}
+
+.conversation.compact .message {
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.conversation.compact .message-avatar {
+  flex-basis: 30px;
+  width: 30px;
+  height: 30px;
+  font-size: 12px;
+}
+
+.conversation.compact .message-content {
+  max-width: calc(100% - 38px);
+}
+
+.conversation.compact .message-label {
+  margin-bottom: 4px;
+  font-size: 11px;
+}
+
+.conversation.compact .message-body {
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.conversation.compact .welcome h2 {
+  font-size: 18px;
+}
+
+.conversation.compact .welcome p {
+  font-size: 12px;
 }
 
 .welcome {

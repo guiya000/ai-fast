@@ -1,13 +1,12 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { NButton, NIcon, useMessage } from "naive-ui";
+import { NButton, NIcon, NSplit, useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import Composer from "../components/Composer.vue";
+import ChatSession from "../components/chat/ChatSession.vue";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 import ConversationSidebar from "../components/ConversationSidebar.vue";
-import MessageList from "../components/MessageList.vue";
 import TrashIcon from "../components/icons/TrashIcon.vue";
 import PanelLeftIcon from "../components/icons/PanelLeftIcon.vue";
 import { copyFor } from "../i18n";
@@ -30,6 +29,8 @@ const settings = ref({
   language: "zh-CN",
   autostart: false,
   activeModelId: null,
+  editorLanguage: "zh-CN",
+  shortcuts: {},
   suppliers: [],
   models: [],
 });
@@ -37,9 +38,6 @@ const router = useRouter();
 const message = useMessage();
 const sidebarCollapsed = ref(false);
 const sidebarWidth = ref(250);
-const isResizingSidebar = ref(false);
-let sidebarResizeStartX = 0;
-let sidebarResizeStartWidth = 250;
 
 function isImagesProtocol(apiFormat) {
   return apiFormat === "images" || apiFormat === "imagesApi";
@@ -59,6 +57,7 @@ const activeConversation = computed(() => conversations.value.find(
 ));
 const imageGenerationAvailable = computed(() => isImagesProtocol(activeModel.value?.apiFormat));
 const activeModelIsImage = computed(() => activeModel.value?.functionType === "image" || imageGenerationAvailable.value);
+const activeModelSupportsImage = computed(() => activeModel.value?.inputTypes?.includes("image") === true);
 const functionMode = ref("chat");
 function isImageModel(model) {
   return model?.functionType === "image" || isImagesProtocol(model?.apiFormat);
@@ -175,6 +174,8 @@ async function updateSettings(nextSettings) {
     language: nextSettings.language,
     autostart: nextSettings.autostart,
     activeModelId: nextSettings.activeModelId,
+    editorLanguage: nextSettings.editorLanguage,
+    shortcuts: nextSettings.shortcuts || {},
     suppliers: (nextSettings.suppliers || []).map((supplier) => ({
       name: supplier.name,
       config: {
@@ -188,6 +189,7 @@ async function updateSettings(nextSettings) {
         apiFormat: model.apiFormat,
         requestPath: model.requestPath || "",
         apiKey: model.apiKey,
+        inputTypes: ["text", ...(model.inputTypes || []).filter((inputType) => inputType === "image")],
         temperature: model.temperature,
         maxTokens: model.maxTokens,
         params: model.params || [],
@@ -224,6 +226,10 @@ function openSettings() {
   router.push("/settings");
 }
 
+function openWorkspace() {
+  router.push("/workspace");
+}
+
 function askForConfirmation(message) {
   return new Promise((resolve) => {
     confirmationResolver = resolve;
@@ -245,7 +251,7 @@ function resetComposer() {
 }
 
 function startImageReference(payload) {
-  if (!activeModelIsImage.value || !payload?.image?.dataUrl) return;
+  if (!activeModelIsImage.value || !activeModelSupportsImage.value || !payload?.image?.dataUrl) return;
   input.value = "";
   inputImages.value = [{
     name: payload.image.name || "image.png",
@@ -305,24 +311,9 @@ function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value;
 }
 
-function startSidebarResize(event) {
-  if (sidebarCollapsed.value) return;
-  isResizingSidebar.value = true;
-  sidebarResizeStartX = event.clientX;
-  sidebarResizeStartWidth = sidebarWidth.value;
-  window.addEventListener("mousemove", resizeSidebar);
-  window.addEventListener("mouseup", stopSidebarResize, { once: true });
-}
-
-function resizeSidebar(event) {
-  if (!isResizingSidebar.value) return;
-  sidebarWidth.value = Math.min(380, Math.max(190, sidebarResizeStartWidth + event.clientX - sidebarResizeStartX));
-}
-
-function stopSidebarResize() {
-  if (!isResizingSidebar.value) return;
-  isResizingSidebar.value = false;
-  window.removeEventListener("mousemove", resizeSidebar);
+function updateSidebarSize(size) {
+  const nextSize = Number.parseFloat(size);
+  if (Number.isFinite(nextSize)) sidebarWidth.value = Math.min(380, Math.max(190, nextSize));
 }
 
 function startNewConversation() {
@@ -419,6 +410,7 @@ async function sendMessage(payload, options = {}) {
     const answer = await invoke("chat_completion", {
       request: {
         ...modelRequestParams(activeModel.value?.params),
+        modelId: activeModel.value?.configId || settings.value.activeModelId,
         messages: [...history, requestMessage],
         reasoningEffort: reasoningEffort.value,
         streamId,
@@ -511,10 +503,17 @@ async function cancelGeneration() {
 
 async function deleteMessage(index) {
   if (isActiveConversationSending.value || !activeConversation.value) return;
+  const conversation = activeConversation.value;
+  const target = conversation.messages[index];
+  if (!target) return;
   if (!(await askForConfirmation(copy.value.deleteMessageConfirm))) return;
-  activeConversation.value.messages.splice(index, 1);
-  if (activeConversation.value.messages.length === 0) activeConversation.value.title = "新建对话";
-  touchConversation(activeConversation.value);
+  conversation.messages.splice(index, 1);
+  if (conversation.messages.length === 0) conversation.title = "新建对话";
+  if (activeConversation.value === conversation) {
+    if (editingMessageIndex.value === index) resetComposer();
+    else if (editingMessageIndex.value !== null && index < editingMessageIndex.value) editingMessageIndex.value -= 1;
+  }
+  touchConversation(conversation);
   await persistConversations();
 }
 
@@ -557,27 +556,40 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopStreamListener?.();
-  stopSidebarResize();
 });
 </script>
 
 <template>
-  <main class="app-shell" :class="[themeClass, { 'sidebar-collapsed': sidebarCollapsed, 'is-resizing-sidebar': isResizingSidebar } ]" :style="{ '--sidebar-width': `${sidebarWidth}px` }">
-    <ConversationSidebar
-      :conversations="visibleConversations"
-      v-model:search="conversationSearch"
-      :active-id="activeConversationId"
-      :locale="settings.language"
-      :collapsed="sidebarCollapsed"
-      @new="startNewConversation"
-      @select="selectConversation"
-      @delete="deleteConversation"
-      @settings="openSettings"
-      @toggle-collapse="toggleSidebar"
-      @resize-start="startSidebarResize"
-    />
+  <main class="home-shell">
+    <NSplit
+    class="app-shell"
+    :class="[themeClass, { 'sidebar-collapsed': sidebarCollapsed }]"
+    direction="horizontal"
+    :size="sidebarCollapsed ? '0px' : `${sidebarWidth}px`"
+    min="190px"
+    max="380px"
+    :disabled="sidebarCollapsed"
+    :resize-trigger-size="6"
+    @update:size="updateSidebarSize"
+  >
+    <template #1>
+      <ConversationSidebar
+        :conversations="visibleConversations"
+        v-model:search="conversationSearch"
+        :active-id="activeConversationId"
+        :locale="settings.language"
+        :collapsed="sidebarCollapsed"
+        @new="startNewConversation"
+        @select="selectConversation"
+        @delete="deleteConversation"
+        @settings="openSettings"
+        @workspace="openWorkspace"
+        @toggle-collapse="toggleSidebar"
+      />
+    </template>
 
-    <section class="chat-shell">
+    <template #2>
+      <section class="chat-shell">
       <header class="topbar" data-tauri-drag-region>
         <n-button v-if="sidebarCollapsed" class="icon-button sidebar-open-button" quaternary circle :title="copy.expandSidebar" :aria-label="copy.expandSidebar" @click="toggleSidebar">
           <template #icon><n-icon><PanelLeftIcon /></n-icon></template>
@@ -591,9 +603,10 @@ onUnmounted(() => {
         </n-button>
       </header>
 
-      <MessageList ref="messageList" :messages="messages" :is-sending="isActiveConversationSending" :is-generating-image="isGeneratingImage" :image-editing-available="activeModelIsImage" :locale="settings.language" @delete-message="deleteMessage" @edit-message="editMessage" @reference-image="startImageReference" />
-      <Composer
+      <ChatSession
+        ref="messageList"
         v-model="input"
+        :messages="messages"
         :initial-images="inputImages"
         :is-editing="editingMessageIndex !== null"
         :is-sending="isSending"
@@ -606,15 +619,21 @@ onUnmounted(() => {
         :reasoning-presets="reasoningPresets"
         :image-model="activeModelIsImage"
         :image-params="imageParams"
+        :capabilities="{ imageInput: activeModelSupportsImage, imageEditing: activeModelIsImage && activeModelSupportsImage }"
         @select-model="selectModel"
         @select-function-mode="selectFunctionMode"
         @cancel-generation="cancelGeneration"
         @update-reasoning-effort="updateReasoningEffort"
         @update-image-param="updateImageParam"
         @cancel-edit="cancelEditMessage"
+        @edit-message="editMessage"
+        @delete-message="deleteMessage"
+        @reference-image="startImageReference"
         @send="sendMessage"
       />
-    </section>
+      </section>
+    </template>
+    </NSplit>
 
     <ConfirmDialog
       :visible="Boolean(confirmation)"
@@ -630,24 +649,25 @@ onUnmounted(() => {
 
 <style scoped>
 .app-shell {
-  display: grid;
-  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  display: flex;
   width: 100%;
   height: 100vh;
   min-height: 100vh;
+  min-width: 0;
   overflow: hidden;
   background: var(--app-bg);
   color: var(--text);
 }
 
-.app-shell.sidebar-collapsed {
-  grid-template-columns: 0 minmax(0, 1fr);
-}
+.home-shell { width: 100%; height: 100vh; min-width: 0; overflow: hidden; }
+
+.app-shell :deep(.n-split-pane-1), .app-shell :deep(.n-split-pane-2) { height: 100%; min-width: 0; min-height: 0; overflow: hidden; }
 
 .chat-shell {
   display: flex;
+  height: 100%;
   min-width: 0;
-  min-height: 100vh;
+  min-height: 0;
   flex-direction: column;
   overflow: hidden;
 }
@@ -691,24 +711,8 @@ onUnmounted(() => {
 }
 
 @media (max-width: 720px) {
-  .app-shell,
-  .app-shell.sidebar-collapsed {
+  .app-shell {
     position: relative;
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .app-shell :deep(.sidebar) {
-    position: absolute;
-    z-index: 10;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    width: min(var(--sidebar-width), calc(100vw - 24px));
-    box-shadow: 8px 0 24px rgb(15 23 42 / 14%);
-  }
-
-  .app-shell.sidebar-collapsed :deep(.sidebar) {
-    width: 0;
   }
 
   .topbar {

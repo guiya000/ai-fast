@@ -1,11 +1,16 @@
 <script setup>
-import { nextTick, onMounted, ref } from "vue";
+import { nextTick, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { NMessageProvider } from "naive-ui";
 
 const isLaunching = ref(true);
 
+function preventDefaultContextMenu(event) {
+  event.preventDefault();
+}
+
 onMounted(async () => {
+  document.addEventListener("contextmenu", preventDefaultContextMenu);
   await nextTick();
   await new Promise((resolve) => requestAnimationFrame(resolve));
   try {
@@ -16,6 +21,10 @@ onMounted(async () => {
   window.setTimeout(() => {
     isLaunching.value = false;
   }, 700);
+});
+
+onUnmounted(() => {
+  document.removeEventListener("contextmenu", preventDefaultContextMenu);
 });
 </script>
 

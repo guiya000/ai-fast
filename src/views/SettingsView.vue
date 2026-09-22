@@ -44,6 +44,27 @@ const activeModelId = ref(null);
 const theme = ref("system");
 const themeClass = computed(() => `theme-${theme.value || "system"}`);
 const autostart = ref(false);
+const editorLanguage = ref("zh-CN");
+const defaultShortcuts = {
+  closeTab: "Ctrl+W",
+  reopenTab: "Ctrl+Shift+T",
+  switchTab: "Ctrl+Tab",
+  nextTab: "Ctrl+PageDown",
+  previousTab: "Ctrl+PageUp",
+  quickOpen: "Ctrl+P",
+  commandPalette: "Ctrl+Shift+P",
+  saveFile: "Ctrl+S",
+  aiEdit: "Ctrl+Enter",
+  formatDocument: "Shift+Alt+F",
+  toggleComment: "Ctrl+/",
+  goToDefinition: "F12",
+  renameSymbol: "F2",
+};
+const shortcuts = ref({ ...defaultShortcuts });
+const shortcutRows = computed(() => Object.keys(defaultShortcuts).map((key) => ({
+  key,
+  label: copy.value[`shortcut${key[0].toUpperCase()}${key.slice(1)}`],
+})));
 const suppliers = ref([]);
 const editingIndex = ref(null);
 const editingSupplier = ref(null);
@@ -73,6 +94,7 @@ function validateTrimmedLength(value, message) {
 
 const parameterTypes = ["string", "boolean", "number"];
 const functionTypes = ["chat", "image"];
+const inputTypes = ["text", "image"];
 
 function normalizeParamValue(value, valueType) {
   if (valueType === "boolean") return value === true || value === "true";
@@ -149,7 +171,15 @@ function modelNameRules(modelIndex) {
 
 const modelIdRules = computed(() => [requiredRule(copy.value.fieldRequired)]);
 const apiFormatRules = computed(() => [requiredRule(copy.value.fieldRequired, "change")]);
-const apiKeyRules = computed(() => [requiredRule(copy.value.fieldRequired)]);
+function apiKeyRulesFor(model) {
+  return [{
+    validator: (_, value) => {
+      if (String(value || "").trim() || model.apiKeySet) return true;
+      return new Error(copy.value.fieldRequired);
+    },
+    trigger: ["input", "blur"],
+  }];
+}
 const parameterTypeOptions = computed(() => [
   { label: copy.value.paramString, value: "string" },
   { label: copy.value.paramBoolean, value: "boolean" },
@@ -158,6 +188,10 @@ const parameterTypeOptions = computed(() => [
 const functionTypeOptions = computed(() => [
   { label: copy.value.chatFunction, value: "chat" },
   { label: copy.value.imageFunction, value: "image" },
+]);
+const inputTypeOptions = computed(() => [
+  { label: copy.value.inputText, value: "text" },
+  { label: copy.value.inputImage, value: "image" },
 ]);
 const apiFormatOptions = computed(() => [
   { label: copy.value.chatCompletions, endpoint: copy.value.chatCompletionsEndpoint, value: "chatCompletions" },
@@ -183,7 +217,7 @@ const supplierRules = computed(() => {
       name: modelNameRules(modelIndex),
       id: modelIdRules.value,
       apiFormat: apiFormatRules.value,
-      apiKey: apiKeyRules.value,
+      apiKey: apiKeyRulesFor(editingSupplier.value.models[modelIndex]),
     };
   });
   return rules;
@@ -199,9 +233,11 @@ function createModel() {
     localId: createId(),
     name: copy.value.modelDefaultName,
     functionType: "chat",
+    inputTypes: ["text"],
     apiFormat: "chatCompletions",
     requestPath: "",
     apiKey: "",
+    apiKeySet: false,
     params: [],
   };
 }
@@ -348,6 +384,7 @@ function importQueriedModels() {
       name: uniqueModelName(importedModelName(item), usedNames),
       id: item.id,
       functionType: targetModel.functionType,
+      inputTypes: [...(targetModel.inputTypes || ["text"])],
       apiFormat: targetModel.apiFormat,
       requestPath: targetModel.requestPath,
       apiKey: targetModel.apiKey,
@@ -385,9 +422,14 @@ function cloneSupplier(supplier) {
       functionType: functionTypes.includes(model.functionType)
         ? model.functionType
         : (model.apiFormat === "images" || model.apiFormat === "imagesApi" ? "image" : "chat"),
+      inputTypes: (() => {
+        const selected = Array.isArray(model.inputTypes) ? model.inputTypes.filter((inputType) => inputTypes.includes(inputType)) : [];
+        return ["text", ...selected.filter((inputType) => inputType === "image")];
+      })(),
       apiFormat: model.apiFormat || "chatCompletions",
       requestPath: model.requestPath || "",
       apiKey: model.apiKey || "",
+      apiKeySet: Boolean(model.apiKeySet),
       apiKeyVisible: false,
       params: normalizeModelParams(model.params),
     })),
@@ -449,6 +491,7 @@ function copyModel(model) {
   };
   editingSupplier.value.models.push(copiedModel);
   expandedModelNames.value = [copiedModel.localId];
+  message.success(copy.value.modelCopied, { duration: 1800 });
 }
 
 function removeModel(index) {
@@ -503,6 +546,11 @@ function changeFunctionType(model, functionType) {
   else if (model.apiFormat === "images" || model.apiFormat === "imagesApi") model.apiFormat = "chatCompletions";
 }
 
+function updateInputTypes(model, value) {
+  const selected = Array.isArray(value) ? value.filter((inputType) => inputTypes.includes(inputType)) : [];
+  model.inputTypes = ["text", ...selected.filter((inputType) => inputType !== "text")];
+}
+
 function removeParam(model, index) {
   model.params.splice(index, 1);
 }
@@ -541,6 +589,7 @@ function normalizeSupplier(supplier) {
       name: model.name.trim(),
       apiFormat: model.apiFormat,
       functionType: model.functionType,
+      inputTypes: ["text", ...(model.inputTypes || []).filter((inputType) => inputType === "image")],
       requestPath: model.requestPath.trim(),
       apiKey: model.apiKey.trim(),
       params: normalizeModelParams(model.params),
@@ -593,6 +642,8 @@ function persistSettings(nextSuppliers = suppliers.value, nextActiveModelId = ac
     language: locale.value,
     autostart: autostart.value,
     activeModelId: nextActiveModelId,
+    editorLanguage: editorLanguage.value,
+    shortcuts: shortcuts.value,
     suppliers: nextSuppliers,
   });
 }
@@ -605,6 +656,8 @@ async function saveSettings(nextSettings) {
     locale.value = result.language;
     autostart.value = result.autostart;
     activeModelId.value = result.activeModelId;
+    editorLanguage.value = result.editorLanguage || "zh-CN";
+    shortcuts.value = { ...defaultShortcuts, ...(result.shortcuts || {}) };
     suppliers.value = result.suppliers.map(cloneSupplier);
     message.success(copy.value.saved);
     return true;
@@ -624,6 +677,8 @@ async function clearData() {
     locale.value = "zh-CN";
     autostart.value = false;
     activeModelId.value = null;
+    editorLanguage.value = "zh-CN";
+    shortcuts.value = { ...defaultShortcuts };
     suppliers.value = [];
     closeEditor();
     message.success(copy.value.saved);
@@ -640,6 +695,8 @@ async function loadSettings() {
     locale.value = result.language;
     autostart.value = result.autostart;
     activeModelId.value = result.activeModelId;
+    editorLanguage.value = result.editorLanguage || "zh-CN";
+    shortcuts.value = { ...defaultShortcuts, ...(result.shortcuts || {}) };
     suppliers.value = result.suppliers.map(cloneSupplier);
   } catch (loadError) {
     message.error(`${copy.value.settingsLoadFailed}：${String(loadError)}`, { duration: 2000 });
@@ -649,6 +706,11 @@ async function loadSettings() {
 }
 
 function updateGeneralSettings() {
+  persistSettings();
+}
+
+function resetShortcuts() {
+  shortcuts.value = { ...defaultShortcuts };
   persistSettings();
 }
 
@@ -678,9 +740,31 @@ onMounted(loadSettings);
             <n-select v-model:value="locale" :options="[{ label: copy.chinese, value: 'zh-CN' }, { label: copy.english, value: 'en-US' }]" style="width: 180px" @update:value="updateGeneralSettings" />
           </n-space>
           <n-space align="center" justify="space-between">
+            <span>
+              <strong>{{ copy.editorLanguage }}</strong>
+              <small class="settings-inline-hint">{{ copy.editorLanguageHint }}</small>
+            </span>
+            <n-select v-model:value="editorLanguage" :options="[{ label: copy.editorChinese, value: 'zh-CN' }, { label: copy.editorEnglish, value: 'en-US' } ]" style="width: 180px" @update:value="updateGeneralSettings" />
+          </n-space>
+          <n-space align="center" justify="space-between">
             <span>{{ copy.autostart }}</span>
             <n-switch v-model:value="autostart" @update:value="updateGeneralSettings" />
           </n-space>
+          <div class="shortcut-settings">
+            <div class="shortcut-settings-heading">
+              <div>
+                <strong>{{ copy.keyboardShortcuts }}</strong>
+                <p>{{ copy.keyboardShortcutsHint }}</p>
+              </div>
+              <n-button size="small" secondary @click="resetShortcuts">{{ copy.resetShortcuts }}</n-button>
+            </div>
+            <div class="shortcut-grid">
+              <div v-for="shortcut in shortcutRows" :key="shortcut.key" class="shortcut-row">
+                <label :for="`shortcut-${shortcut.key}`">{{ shortcut.label }}</label>
+                <n-input :id="`shortcut-${shortcut.key}`" v-model:value="shortcuts[shortcut.key]" size="small" @blur="updateGeneralSettings" />
+              </div>
+            </div>
+          </div>
         </n-space>
       </n-card>
       <div class="supplier-heading">
@@ -802,6 +886,11 @@ onMounted(loadSettings);
                     <n-grid-item>
                       <n-form-item :label="copy.functionType" :path="`models.${modelIndex}.functionType`">
                         <n-select v-model:value="model.functionType" :options="functionTypeOptions" @update:value="changeFunctionType(model, $event)" />
+                      </n-form-item>
+                    </n-grid-item>
+                    <n-grid-item>
+                      <n-form-item :label="copy.inputType" :path="`models.${modelIndex}.inputTypes`">
+                        <n-select :value="model.inputTypes" :options="inputTypeOptions" multiple @update:value="updateInputTypes(model, $event)" />
                       </n-form-item>
                     </n-grid-item>
                 </n-grid>
@@ -1023,6 +1112,66 @@ onMounted(loadSettings);
 
 .settings-general-card :deep(.n-card__content) {
   padding-top: 6px;
+}
+
+.settings-inline-hint {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.shortcut-settings {
+  padding-top: 4px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.shortcut-settings-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 16px 0 12px;
+}
+
+.shortcut-settings-heading strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.shortcut-settings-heading p {
+  margin: 5px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.shortcut-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+}
+
+.shortcut-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 140px;
+  align-items: center;
+  gap: 12px;
+  min-height: 34px;
+}
+
+.shortcut-row label {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .shortcut-grid { grid-template-columns: 1fr; }
+  .shortcut-row { grid-template-columns: minmax(0, 1fr) 120px; }
 }
 
 .supplier-heading {

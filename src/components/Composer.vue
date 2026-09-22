@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, ref, watch } from "vue";
-import { NButton, NIcon, NSelect, useMessage } from "naive-ui";
+import { NButton, NIcon, NSelect, NTreeSelect, useMessage } from "naive-ui";
 import { copyFor } from "../i18n";
 import CloseIcon from "./icons/CloseIcon.vue";
 import ImageIcon from "./icons/ImageIcon.vue";
@@ -22,6 +22,12 @@ const props = defineProps({
   imageParams: { type: Array, default: () => [] },
   initialImages: { type: Array, default: () => [] },
   isEditing: { type: Boolean, default: false },
+  variant: { type: String, default: "default" },
+  enableImageInput: { type: Boolean, default: true },
+  showFunctionMode: { type: Boolean, default: true },
+  showModelSelector: { type: Boolean, default: true },
+  showReasoning: { type: Boolean, default: true },
+  showStopGeneration: { type: Boolean, default: true },
 });
 
 const message = useMessage();
@@ -35,7 +41,7 @@ const pendingImages = ref(0);
 const isDragActive = ref(false);
 const dragLeaveTimer = ref(null);
 const copy = computed(() => copyFor(props.locale));
-const canSubmit = computed(() => !pendingImages.value && Boolean(draft.value.trim() || attachments.value.length));
+const canSubmit = computed(() => !pendingImages.value && Boolean(draft.value.trim() || (props.enableImageInput && attachments.value.length)));
 function isImageModel(model) {
   return model?.functionType === "image" || model?.apiFormat === "images" || model?.apiFormat === "imagesApi";
 }
@@ -50,10 +56,11 @@ const supplierGroups = computed(() => {
   return [...groups.entries()].map(([name, models]) => ({ name, models }));
 });
 const modelOptions = computed(() => supplierGroups.value.map((supplier) => ({
-  type: "group",
+  key: `supplier:${supplier.name}`,
   label: supplier.name,
-  key: supplier.name,
+  disabled: true,
   children: supplier.models.map((model) => ({
+    key: model.configId || model.id,
     label: model.name || copy.value.unnamedModel,
     value: model.configId || model.id,
   })),
@@ -77,6 +84,10 @@ watch(() => props.initialImages, (images) => {
     id: image.id || `${image.name || "image"}-${index}-${image.dataUrl?.slice(-12) || ""}`,
   }));
 }, { immediate: true });
+
+watch(() => props.enableImageInput, (enabled) => {
+  if (!enabled) attachments.value = [];
+});
 
 watch(() => props.modelValue, (value) => {
   if (value !== draft.value) {
@@ -108,8 +119,9 @@ function onKeydown(event) {
 }
 
 function submit() {
-  if ((!draft.value.trim() && attachments.value.length === 0) || props.isSending) return;
-  emit("send", { content: draft.value, images: attachments.value });
+  const images = props.enableImageInput ? attachments.value : [];
+  if ((!draft.value.trim() && images.length === 0) || props.isSending) return;
+  emit("send", { content: draft.value, images });
   attachments.value = [];
 }
 
@@ -146,7 +158,7 @@ function addImages(event) {
 }
 
 function handleDragOver(event) {
-  if (props.isSending) return;
+  if (props.isSending || !props.enableImageInput) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = "copy";
   isDragActive.value = true;
@@ -161,7 +173,7 @@ function handleDragLeave(event) {
 }
 
 function handleDrop(event) {
-  if (props.isSending) return;
+  if (props.isSending || !props.enableImageInput) return;
   event.preventDefault();
   isDragActive.value = false;
   const files = Array.from(event.dataTransfer?.files || []);
@@ -192,7 +204,7 @@ function addTextFile(file) {
 }
 
 function handlePaste(event) {
-  if (props.isSending) return;
+  if (props.isSending || !props.enableImageInput) return;
   const files = Array.from(event.clipboardData?.items || [])
     .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
     .map((item) => item.getAsFile())
@@ -219,16 +231,20 @@ onMounted(resizeTextarea);
         </n-button>
       </div>
     </div>
-    <form class="composer" :class="{ 'drag-active': isDragActive, 'is-sending': props.isSending }" @submit.prevent="submit" @dragover="handleDragOver" @dragleave="handleDragLeave" @drop="handleDrop">
+    <form class="composer" :class="{ compact: props.variant === 'compact', 'drag-active': isDragActive, 'is-sending': props.isSending }" @submit.prevent="submit" @dragover="handleDragOver" @dragleave="handleDragLeave" @drop="handleDrop">
       <div v-if="props.isEditing" class="composer-editing">
         {{ copy.editingMessage }}
         <n-button text type="primary" size="small" @click="emit('cancel-edit')">{{ copy.cancel }}</n-button>
       </div>
-      <div v-if="isDragActive" class="drop-hint">{{ copy.dropFiles }}</div>
+      <div v-if="isDragActive && props.enableImageInput" class="drop-hint">{{ copy.dropFiles }}</div>
       <textarea ref="textarea" :value="draft" :disabled="props.isSending" rows="1" :placeholder="copy.inputPlaceholder" :aria-label="copy.inputPlaceholder" @input="updateDraft" @keydown="onKeydown" @paste="handlePaste" />
-      <input ref="imageInput" class="image-input" type="file" accept="image/*" multiple @change="addImages" />
-      <div class="composer-inline-tools">
-        <div class="function-mode-switch" role="group" :aria-label="copy.functionMode">
+      <input v-if="props.enableImageInput" ref="imageInput" class="image-input" type="file" accept="image/*" multiple @change="addImages" />
+      <div class="composer-inline-tools" :class="{ 'has-image-input': props.enableImageInput }">
+        <div v-if="props.showModelSelector" class="composer-select-wrap composer-model-select">
+          <span>{{ copy.currentModel }}</span>
+          <n-tree-select :value="props.activeModelId || null" :options="modelOptions" :placeholder="copy.noModelSelected" :disabled="props.isSending || props.models.length === 0" :aria-label="copy.currentModel" :show-path="false" :filterable="true" :default-expand-all="true" :indent="14" size="small" @update:value="$emit('select-model', $event)" />
+        </div>
+        <div v-if="props.showFunctionMode" class="function-mode-switch" role="group" :aria-label="copy.functionMode">
           <button
             v-for="mode in functionModes"
             :key="mode.value"
@@ -240,23 +256,19 @@ onMounted(resizeTextarea);
             {{ mode.label }}
           </button>
         </div>
-        <n-button class="image-button" quaternary circle type="button" :disabled="props.isSending || attachments.length + pendingImages >= maxImages" :title="copy.imageLimit" :aria-label="copy.imageLimit" @click="openImagePicker">
+        <n-button v-if="props.enableImageInput" class="image-button" quaternary circle type="button" :disabled="props.isSending || attachments.length + pendingImages >= maxImages" :title="copy.imageLimit" :aria-label="copy.imageLimit" @click="openImagePicker">
           <template #icon><n-icon><ImageIcon /></n-icon></template>
         </n-button>
         <n-button v-if="!props.isSending" class="send-button" type="primary" circle attr-type="submit" :disabled="!canSubmit" :aria-label="copy.sendMessage" :title="copy.sendMessage">
           <template #icon><n-icon><SendIcon /></n-icon></template>
         </n-button>
-        <n-button v-else class="stop-button" type="error" circle :disabled="props.isCanceling" :aria-label="copy.stopGenerating" :title="copy.stopGenerating" @click="$emit('cancel-generation')">
+        <n-button v-else-if="props.showStopGeneration" class="stop-button" type="error" circle :disabled="props.isCanceling" :aria-label="copy.stopGenerating" :title="copy.stopGenerating" @click="$emit('cancel-generation')">
           <template #icon><n-icon><StopIcon /></n-icon></template>
         </n-button>
       </div>
     </form>
     <div class="composer-tools">
-      <div class="composer-select-wrap">
-        <span>{{ copy.currentModel }}</span>
-        <n-select :value="props.activeModelId || null" :options="modelOptions" :placeholder="copy.noModelSelected" :disabled="props.isSending || props.models.length === 0" :aria-label="copy.currentModel" size="small" @update:value="$emit('select-model', $event)" />
-      </div>
-      <div v-if="!props.imageModel" class="composer-select-wrap output-size-select">
+      <div v-if="props.showReasoning && !props.imageModel" class="composer-select-wrap output-size-select">
           <span>{{ copy.reasoningEffort }} <small :title="copy.reasoningEffortHint"><InfoIcon /></small></span>
           <n-select :value="props.reasoningEffort" :options="reasoningOptions" :disabled="props.isSending || props.models.length === 0" :aria-label="copy.reasoningEffort" size="small" @update:value="$emit('update-reasoning-effort', $event)" />
       </div>
@@ -321,6 +333,20 @@ onMounted(resizeTextarea);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
+.composer.compact {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 7px;
+}
+
+.composer.compact .composer-inline-tools {
+  gap: 5px;
+}
+
+.composer.compact .composer-select-wrap :deep(.n-select) {
+  min-width: 0;
+}
+
 .composer > * {
   position: relative;
   z-index: 2;
@@ -382,7 +408,21 @@ onMounted(resizeTextarea);
   width: 100%;
 }
 
+.composer-model-select {
+  flex: 0 1 270px;
+}
+
+.composer-model-select :deep(.n-tree-select) {
+  min-width: 150px;
+  flex: 1;
+}
+
 .composer-inline-tools .image-button {
+  margin-left: auto;
+}
+
+.composer-inline-tools:not(.has-image-input) .send-button,
+.composer-inline-tools:not(.has-image-input) .stop-button {
   margin-left: auto;
 }
 
